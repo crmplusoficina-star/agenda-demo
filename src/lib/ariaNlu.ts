@@ -1,0 +1,431 @@
+// Interpretador local da ArIA: entende o pedido sem depender de IA externa.
+// Sinônimos, tolerância a erro de digitação, datas em português e aprendizado por escolha do usuário.
+
+export type NluIntent =
+  | 'trocar_filial_tecnico' | 'agendar_atendimento' | 'remarcar_atendimento' | 'concluir_atendimento'
+  | 'excluir_atendimento' | 'adicionar_tecnico' | 'desativar_tecnico' | 'criar_followup'
+  | 'informar_cidade_maquina' | 'oportunidades_rota' | 'pendencias_filial' | 'navegar' | 'tecnicos_ociosos'
+  | 'agenda_dia' | 'onde_tecnico' | 'carga_semana' | 'faturamento' | 'pendentes_faturamento' | 'faturar_atendimento'
+  | 'historico_maquina' | 'registrar_horimetro' | 'contato_cliente' | 'salvar_contato' | 'atendimentos_incompletos'
+  | 'pendencias_atrasadas' | 'resumo_semana' | 'folga_ferias' | 'realocar_dia' | 'adicionar_observacao' | 'ajuda'
+  | 'planejar_regiao' | 'sugestoes' | 'aprendizado';
+
+export type NluResult = { intent: NluIntent; score: number; args: Record<string, string> };
+export type NluContext = { technicians: { name: string; branch: string }[]; branches: string[] };
+
+export const INTENT_LABELS: Record<NluIntent, string> = {
+  agendar_atendimento: 'Agendar atendimento',
+  remarcar_atendimento: 'Remarcar atendimento',
+  concluir_atendimento: 'Concluir atendimento',
+  excluir_atendimento: 'Excluir atendimento',
+  trocar_filial_tecnico: 'Trocar filial de técnico',
+  adicionar_tecnico: 'Adicionar técnico',
+  desativar_tecnico: 'Desativar técnico',
+  criar_followup: 'Abrir follow-up',
+  informar_cidade_maquina: 'Informar cidade da máquina',
+  oportunidades_rota: 'Oportunidades na rota',
+  pendencias_filial: 'Pendências 150h/campanhas',
+  navegar: 'Abrir uma tela',
+  tecnicos_ociosos: 'Técnicos sem atendimento',
+  agenda_dia: 'Agenda do dia',
+  onde_tecnico: 'Onde está o técnico',
+  carga_semana: 'Carga da semana',
+  faturamento: 'Previsão de faturamento',
+  pendentes_faturamento: 'Pendentes de faturamento',
+  faturar_atendimento: 'Marcar como faturado',
+  historico_maquina: 'Histórico da máquina',
+  registrar_horimetro: 'Registrar horímetro',
+  contato_cliente: 'Contato do cliente',
+  salvar_contato: 'Salvar telefone do cliente',
+  atendimentos_incompletos: 'Atendimentos incompletos',
+  pendencias_atrasadas: '150h/campanhas atrasadas',
+  resumo_semana: 'Resumo da semana',
+  folga_ferias: 'Folga ou férias',
+  realocar_dia: 'Técnico faltou (passar agenda)',
+  adicionar_observacao: 'Anotar no atendimento',
+  ajuda: 'O que a ArIA faz',
+  planejar_regiao: 'Analisar região do técnico',
+  sugestoes: 'Sugestões do dia',
+  aprendizado: 'O que a ArIA aprendeu',
+};
+
+const STOP = new Set(['o', 'a', 'os', 'as', 'de', 'do', 'da', 'dos', 'das', 'para', 'pra', 'pro', 'em', 'no', 'na', 'e', 'um', 'uma', 'que', 'com', 'por', 'me', 'eu', 'voce', 'favor', 'gostaria', 'quero', 'queria', 'preciso', 'pode', 'consegue', 'ai', 'ali', 'ja', 'hoje', 'ele', 'ela', 'dele', 'dela', 'esse', 'essa', 'este', 'esta', 'tecnico', 'tecnica', 'filial', 'atendimento', 'agendamento', 'visita', 'cliente']);
+
+export function normalize(value: string) {
+  return ` ${String(value || '')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^\w\s/:-]/g, ' ')
+    .replace(/\bvc\b/g, 'voce').replace(/\bq\b/g, 'que').replace(/\btec\b/g, 'tecnico')
+    .replace(/\bpro\b/g, 'para o').replace(/\bpra\b/g, 'para').replace(/\bpras?\b/g, 'para')
+    .replace(/\bfollow ?up\b|\bfollowup\b|\bfup\b/g, 'followup')
+    .replace(/\s+/g, ' ')
+    .trim()} `;
+}
+
+function lev(a: string, b: string) {
+  if (a === b) return 0;
+  if (Math.abs(a.length - b.length) > 2) return 3;
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i += 1) {
+    let prev = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const tmp = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = tmp;
+    }
+  }
+  return row[b.length];
+}
+
+function words(text: string) {
+  return text.trim().split(' ').filter(Boolean);
+}
+
+// palavra parecida (tolera 1 erro em palavras >= 5 letras, 2 erros em >= 8)
+function wordLike(word: string, target: string) {
+  if (word === target) return true;
+  if (target.length >= 5 && word.length >= 4) return lev(word, target) <= (target.length >= 8 ? 2 : 1);
+  return false;
+}
+
+const NOUNS = /^(agendas?$|agendament|atendiment|programaca|marcaca|cadastr[oa]s?$|retorno$|visitas?$)/;
+
+function hasStem(text: string, stems: string[], allowNouns = false) {
+  const ws = words(text).filter((w) => allowNouns || !NOUNS.test(w));
+  return stems.some((stem) => stem.includes(' ') ? text.includes(` ${stem}`) : ws.some((w) => w.startsWith(stem) || (stem.length >= 5 && wordLike(w.slice(0, stem.length + 2), stem))));
+}
+
+export function matchTechnician(text: string, techs: NluContext['technicians']) {
+  const ws = words(text).filter((w) => !STOP.has(w) && w.length >= 3);
+  let best: { name: string; branch: string; score: number } | null = null;
+  for (const tech of techs) {
+    const parts = normalize(tech.name).trim().split(' ').filter((p) => p.length >= 3);
+    let score = 0;
+    for (const part of parts) {
+      if (ws.includes(part)) score += 3;
+      else if (ws.some((w) => wordLike(w, part))) score += 2;
+    }
+    if (score > 0 && (!best || score > best.score)) best = { ...tech, score };
+  }
+  return best && best.score >= 2 ? best : null;
+}
+
+export function matchBranch(text: string, branches: string[], exclude?: string) {
+  let best: { name: string; score: number } | null = null;
+  for (const branch of branches) {
+    if (branch === exclude) continue;
+    const b = normalize(branch).trim();
+    let score = 0;
+    if (text.includes(` ${b} `)) score = 10;
+    else {
+      const bw = b.split(' ');
+      const ws = words(text);
+      const hits = bw.filter((part) => ws.some((w) => wordLike(w, part) || w === part || (part.length === 4 && w.length === 4 && lev(w, part) <= 1))).length;
+      if (hits === bw.length) score = 6 + hits;
+    }
+    if (score && (!best || score > best.score)) best = { name: branch, score };
+  }
+  return best?.name || '';
+}
+
+const MONTHS = ['janeiro', 'fevereiro', 'marco', 'abril', 'maio', 'junho', 'julho', 'agosto', 'setembro', 'outubro', 'novembro', 'dezembro'];
+const WEEK = ['domingo', 'segunda', 'terca', 'quarta', 'quinta', 'sexta', 'sabado'];
+
+function iso(d: Date) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// Devolve todas as datas citadas, na ordem em que aparecem.
+export function extractDates(raw: string, today = new Date()): string[] {
+  const text = normalize(raw);
+  const found: { pos: number; date: string }[] = [];
+  const push = (pos: number, d: Date) => { if (!Number.isNaN(d.getTime())) found.push({ pos, date: iso(d) }); };
+  const add = (n: number) => { const d = new Date(today); d.setDate(d.getDate() + n); return d; };
+
+  for (const m of text.matchAll(/\bdepois de amanha\b/g)) push(m.index!, add(2));
+  for (const m of text.matchAll(/(?<!depois de )\bamanha\b/g)) push(m.index!, add(1));
+  for (const m of text.matchAll(/\bhoje\b/g)) push(m.index!, add(0));
+  for (const m of text.matchAll(/\bontem\b/g)) push(m.index!, add(-1));
+  for (const m of text.matchAll(/\b(semana que vem|proxima semana)\b/g)) { const d = add(((8 - today.getDay()) % 7) || 7); push(m.index!, d); }
+  for (const m of text.matchAll(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/g)) {
+    const y = m[3] ? (m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3])) : today.getFullYear();
+    push(m.index!, new Date(y, Number(m[2]) - 1, Number(m[1])));
+  }
+  for (const m of text.matchAll(new RegExp(`\\b(\\d{1,2}) de (${MONTHS.join('|')})(?: de (\\d{4}))?\\b`, 'g'))) {
+    push(m.index!, new Date(m[3] ? Number(m[3]) : today.getFullYear(), MONTHS.indexOf(m[2]), Number(m[1])));
+  }
+  for (const m of text.matchAll(/\bdia (\d{1,2})\b(?! de)/g)) {
+    const day = Number(m[1]);
+    const d = new Date(today.getFullYear(), today.getMonth(), day);
+    if (d < add(-1)) d.setMonth(d.getMonth() + 1);
+    push(m.index!, d);
+  }
+  for (const m of text.matchAll(new RegExp(`\\b(proxima |proximo |nessa |nesta |essa |esta )?(${WEEK.join('|')})(?:-feira| feira)?\\b`, 'g'))) {
+    const idx = WEEK.indexOf(m[2]);
+    let diff = (idx - today.getDay() + 7) % 7;
+    if ((m[1] || '').startsWith('prox')) diff = diff || 7;
+    push(m.index!, add(diff));
+  }
+  return found.sort((a, b) => a.pos - b.pos).map((f) => f.date).filter((d, i, arr) => arr.indexOf(d) === i);
+}
+
+export function extractPin(raw: string) {
+  const m = raw.toUpperCase().match(/\b(?=[A-Z0-9]*\d{4})[A-Z]{2,5}[A-Z0-9]{8,16}\b/);
+  return m ? m[0] : '';
+}
+
+// Texto livre depois de uma palavra-chave (ex.: "cliente X", "para o X").
+function tailAfter(raw: string, keys: RegExp) {
+  const m = raw.match(keys);
+  if (!m) return '';
+  return m[1].replace(/\s+(amanh[ãa]|hoje|ontem|dia \d+|semana que vem|pr[óo]xim[ao]|segunda|ter[çc]a|quarta|quinta|sexta|s[áa]bado|na |no |em |para |pra |com ).*$/i, '').trim();
+}
+
+type Rule = { intent: NluIntent; strong: string[]; weak?: string[]; objects?: string[]; bonus?: (ctx: Slots, text: string) => number };
+type Slots = { tech: string; branch: string; dates: string[]; pin: string; city: string; screen: string };
+
+const QUESTION = /^ (quem|quais|qual|quanto|quantos|quantas|como|onde|quando|tem |existe|o que) /;
+
+const RULES: Rule[] = [
+  { intent: 'trocar_filial_tecnico', strong: ['realoc'], weak: ['troc', 'mud', 'transfer', 'pass', 'mov', 'alter', 'jog', 'coloc', 'associ', 'lev', 'mand', 'vai atender', 'devolv', 'volt', 'retorn'], objects: ['filial', 'base', 'unidade', 'regional'], bonus: (s) => (s.tech && s.branch && !s.dates.length ? 4 : 0) - (s.dates.length ? 4 : 0) },
+  { intent: 'agendar_atendimento', strong: ['agend', 'encaix', 'novo atendimento', 'nova visita', 'coloc na agenda', 'coloca na agenda', 'program', 'marc'], weak: ['cri', 'mand', 'bot', 'coloc'], objects: ['visita', 'atendimento', '150', '150h', 'campanha', 'revisao', 'garantia', 'diagnostico', 'pmp', 'entrega'], bonus: (s, t) => (s.pin ? 2 : 0) - (QUESTION.test(t) ? 5 : 0) },
+  { intent: 'remarcar_atendimento', strong: ['remarc', 'reagend', 'adi', 'antecip', 'posterg', 'empurr'], weak: ['troc', 'mud', 'pass', 'jog', 'transfer', 'mov', 'bot', 'coloc', 'volt', 'devolv'], objects: ['dia', 'data', 'atendimento', 'visita', 'agendamento', 'horario'], bonus: (s) => (s.dates.length ? 3 : 0) - (s.branch && !s.dates.length ? 4 : 0) },
+  { intent: 'concluir_atendimento', strong: ['conclu', 'finaliz', 'termin', 'execut', 'baix', 'feito', 'realiz'], weak: ['encerr', 'fech'], objects: ['atendimento', 'visita', 'servico', 'os', 'ordem'] },
+  { intent: 'excluir_atendimento', strong: ['exclu', 'apag', 'cancel', 'desmarc', 'delet'], weak: ['remov', 'tir'], objects: ['atendimento', 'agendamento', 'visita', 'agenda', 'os'], bonus: (s, t) => (/\btecnic/.test(t) ? -4 : 0) - (!s.tech && !s.pin && !s.dates.length && !/atendiment|agendament|visita|agenda/.test(t) ? 4 : 0) },
+  { intent: 'adicionar_tecnico', strong: ['contrat', 'entrou'], weak: ['adicion', 'cadastr', 'inclu', 'cri', 'novo', 'nova', 'registr'], objects: ['tecnico', 'tecnica', 'mecanico'] },
+  { intent: 'desativar_tecnico', strong: ['desativ', 'inativ', 'deslig', 'saiu', 'demit', 'demiss', 'pediu as contas'], weak: ['remov', 'tir', 'exclu', 'bloque'], objects: ['tecnico', 'tecnica', 'mecanico', 'empresa'], bonus: (s) => (s.tech ? 1 : 0) },
+  { intent: 'criar_followup', strong: ['followup', 'tratativa', 'prospect'], weak: ['abr', 'cri', 'nov', 'registr', 'lig', 'retorn', 'lembr', 'cobr', 'acompanh'], objects: ['retorno', 'contato', 'ligar', 'oportunidade', 'prospeccao'], bonus: (_s, t) => (QUESTION.test(t) ? -6 : 0) },
+  { intent: 'informar_cidade_maquina', strong: ['esta em', 'fica em', 'localizad', 'trabalhando em', 'rodando em', 'operando em'], weak: ['cidade'], objects: ['maquina', 'equipamento', 'pin', 'serie'], bonus: (s) => (s.pin ? 3 : -3) },
+  { intent: 'oportunidades_rota', strong: ['aproveit'], weak: ['oportunidad', 'pendenc', 'encaix', 'pass'], objects: ['rota', 'viagem', 'regiao', 'caminho', 'semana', 'passando'], bonus: (s) => (s.tech ? 2 : -2) },
+  { intent: 'pendencias_filial', strong: ['pendenc', 'pendente', 'falt', 'resumo', 'situacao'], weak: ['quant', 'status', 'aberto'], objects: ['150', '150h', 'campanha', 'campanhas', 'inspecao', 'filial', 'programar'], bonus: (s, t) => (s.tech ? -2 : 0) - (/fatur/.test(t) ? 6 : 0) - (/resumo/.test(t) && !/150|campanha|inspecao/.test(t) ? 4 : 0) },
+  { intent: 'tecnicos_ociosos', strong: ['ocios', 'disponive', 'livre', 'sem agenda', 'sem atendimento', 'sem servico', 'parado', 'desocupad', 'vago', 'folgad'], weak: ['quem', 'quais'], objects: ['tecnico', 'tecnicos', 'equipe', 'pessoal', 'turma'], bonus: (s, t) => (/\bclientes?\b/.test(t) ? -6 : 0) + (/tecnic|equipe|pessoal|turma/.test(t) ? 2 : -4) },
+  { intent: 'agenda_dia', strong: ['agenda de hoje', 'agenda de amanha', 'agenda do dia', 'agenda da semana', 'agenda de segunda', 'agenda de terca', 'agenda de quarta', 'agenda de quinta', 'agenda de sexta', 'agenda de sabado', 'programacao do dia', 'programacao de hoje', 'programacao de amanha', 'o que tem hoje', 'o que tem amanha', 'o que temos', 'como esta a agenda', 'como ta a agenda', 'como fica a agenda'], weak: ['agenda', 'programacao'], objects: ['hoje', 'amanha', 'dia', 'filial'], bonus: (s) => (s.tech ? -5 : 0) },
+  { intent: 'onde_tecnico', strong: ['onde esta', 'onde ta', 'onde fica', 'cade', 'aonde', 'onde vai estar', 'onde vai', 'esta onde', 'ta onde', 'o que o', 'o que a'], objects: ['hoje', 'amanha', 'agora'], bonus: (s, t) => (s.tech ? 3 : -6) - (/tem|fazendo|vai fazer/.test(t) ? 0 : 0) },
+  { intent: 'carga_semana', strong: ['carga', 'ocupacao', 'carregad', 'sobrecarreg', 'distribuicao', 'quantos atendimentos cada', 'mais atendimento', 'menos atendimento', 'produtividade'], objects: ['tecnico', 'tecnicos', 'equipe', 'semana'] },
+  { intent: 'faturamento', strong: ['faturamento', 'previsao de fatur', 'quanto vamos fatur', 'quanto vai fatur', 'quanto fatur', 'quanto da', 'receita', 'valor previsto', 'quanto ja faturamos'], objects: ['semana', 'mes', 'hoje', 'filial'], bonus: (_s, t) => (/marca|marcar|coloca|ja foi faturad|foi faturad/.test(t) ? -6 : 0) },
+  { intent: 'pendentes_faturamento', strong: ['pendente de faturamento', 'pendentes de faturamento', 'falta faturar', 'faltam faturar', 'nao faturad', 'aguardando faturamento', 'a faturar', 'sem faturar', 'para faturar'], bonus: (_s, t) => (/marca|marcar|coloca/.test(t) ? -6 : 0) },
+  { intent: 'faturar_atendimento', strong: ['marca como faturado', 'marcar como faturado', 'coloca como faturado', 'ja foi faturad', 'foi faturad', 'fatura o atendimento', 'faturei', 'faturado o'], weak: ['faturad', 'fatur'], objects: ['atendimento', 'visita', 'os'], bonus: (_s, t) => (QUESTION.test(t) ? -6 : 0) },
+  { intent: 'historico_maquina', strong: ['historico', 'ultima visita', 'ultimo atendimento', 'o que foi feito', 'ultimas os', 'ultimo horimetro', 'horimetro da', 'horimetro do', 'ficha da maquina'], objects: ['maquina', 'pin', 'serie', 'equipamento'], bonus: (s, t) => (s.pin ? 4 : -6) - (/\d{3,6}\s*(h|hs|horas)\b/.test(t) ? 6 : 0) },
+  { intent: 'registrar_horimetro', strong: ['horimetro', 'horas'], weak: ['registr', 'atualiz', 'anot', 'lanc', 'esta com', 'ta com', 'marcando'], objects: ['maquina', 'pin', 'equipamento'], bonus: (s, t) => (s.pin ? 2 : -3) + (/\b\d{2,6}\s*(h|hs|horas)?\b/.test(t.replace(/\b(?=[a-z0-9]*\d{4})[a-z]{2,5}[a-z0-9]{8,16}\b/g, '')) ? 3 : -6) },
+  { intent: 'contato_cliente', strong: ['telefone', 'contato do', 'contato da', 'whatsapp', 'email do', 'email da', 'numero do cliente', 'numero da', 'falar com', 'quem e o contato'], objects: ['cliente'], bonus: (_s, t) => (/\d{8,}|\(\d{2}\)/.test(t.replace(/\s|-/g, '')) ? -5 : 0) + (/followup|tratativa/.test(t) ? -5 : 0) },
+  { intent: 'salvar_contato', strong: ['telefone', 'whatsapp', 'contato', 'celular', 'numero'], weak: ['salv', 'anot', 'registr', 'guard', 'cadastr'], bonus: (_s, t) => (/\d{8,}/.test(t.replace(/[\s()-]/g, '')) ? 5 : -6) },
+  { intent: 'atendimentos_incompletos', strong: ['sem cidade', 'sem cliente', 'sem serie', 'sem pin', 'incomplet', 'faltando informacao', 'faltando dados', 'cadastro incompleto', 'localizacao pendente', 'cidade nao informada', 'sem localizacao', 'mal preenchid'], objects: ['atendimento', 'agenda'] },
+  { intent: 'pendencias_atrasadas', strong: ['atrasad', 'vencid', 'vencendo', 'prazo', 'urgente', 'urgentes', 'estourad', 'obrigatori'], objects: ['150', '150h', 'campanha', 'campanhas', 'inspecao', 'mandatory'], bonus: (_s, t) => (/150|campanha|inspecao|mandatory|obrigatori/.test(t) ? 2 : -6) },
+  { intent: 'resumo_semana', strong: ['resumo da semana', 'resumo de hoje', 'resumo do dia', 'resumo geral', 'como foi a semana', 'como esta a semana', 'balanco', 'panorama', 'visao geral', 'relatorio', 'indicadores', 'numeros da semana'] },
+  { intent: 'folga_ferias', strong: ['folga', 'ferias', 'atestado', 'licenca', 'day off', 'afastad', 'abonar', 'dispensad'], weak: ['dar', 'lanc', 'coloc', 'registr', 'marc', 'bot'], bonus: (s, t) => (s.tech ? 2 : 0) - (QUESTION.test(t) ? 5 : 0) },
+  { intent: 'realocar_dia', strong: ['faltou', 'nao veio', 'nao vai vir', 'nao vem', 'doente', 'passa os atendimentos', 'passar os atendimentos', 'todos os atendimentos', 'agenda inteira', 'agenda toda', 'cobrir', 'substitu', 'no lugar do', 'no lugar da'], bonus: (_s, t) => 4 - (/folga|ferias/.test(t) ? 7 : 0) },
+  { intent: 'adicionar_observacao', strong: ['observacao', 'anota no', 'anotar no', 'escreve no', 'coloca na descricao', 'adiciona na descricao', 'nota no', 'lembrete no'], objects: ['atendimento', 'visita', 'agendamento'] },
+  { intent: 'planejar_regiao', strong: ['regiao', 'planej', 'analis', 'analiz', 'onde ele tava', 'onde ele estava', 'onde ela estava', 'onde esteve', 'por onde', 'onde passou', 'onde atendeu', 'onde ele atendeu', 'inteligente', 'clientes ali', 'clientes por perto', 'clientes perto', 'redondeza', 'arredores', 'proximidade', 'sugest', 'sugir', 'suger', 'roteiro'], objects: ['visita', 'visitas', 'clientes', 'semana', 'rota'], bonus: (s) => (s.tech ? 4 : -5) },
+  { intent: 'sugestoes', strong: ['sugest', 'sugir', 'suger', 'me indica', 'prioriz', 'recomend', 'dica', 'ideia', 'o que eu faco', 'o que fazer', 'por onde comeco', 'prioridade', 'oportunidades do dia', 'o que priorizar'], bonus: (s, t) => (s.tech ? -6 : 0) - (/\b\d{1,2}\s+clientes?\b/.test(t) || (/\bclientes?\b/.test(t) && /\bem [a-z]{3,}/.test(t)) ? 6 : 0) },
+  { intent: 'aprendizado', strong: ['aprendeu', 'aprendizado', 'aprendizagem', 'te ensinaram', 'ensinaram', 'como te ensino', 'como ensinar', 'nao entendeu ainda', 'o que voce nao entende'] },
+  { intent: 'ajuda', strong: ['o que voce faz', 'o que voce consegue', 'o que vc faz', 'como voce pode ajudar', 'ajuda', 'comandos', 'exemplos', 'me ensina', 'como usar', 'suas funcoes', 'o que da pra fazer', 'o que posso pedir'], bonus: (_s, t) => (t.trim().split(' ').length > 6 ? -3 : 0) },
+  { intent: 'navegar', strong: ['ir para', 'vai para', 'me leva', 'leva para'], weak: ['abr', 'mostr', 'acess', 'entra'], objects: ['tela', 'agenda', 'retencao', 'mapa', 'followup', 'dashboard', 'painel', 'campanhas', '150', 'usuarios'] },
+];
+
+const LEARN_KEY = 'aria-learned-intents-v1';
+
+type Learned = { tokens: string[]; intent: NluIntent };
+
+function keyTokens(text: string, ctx: NluContext) {
+  const techTokens = new Set(ctx.technicians.flatMap((t) => normalize(t.name).trim().split(' ')));
+  const branchTokens = new Set(ctx.branches.flatMap((b) => normalize(b).trim().split(' ')));
+  return words(text).filter((w) => w.length >= 3 && !STOP.has(w) && !techTokens.has(w) && !branchTokens.has(w) && !/\d/.test(w) && !WEEK.includes(w) && !MONTHS.includes(w));
+}
+
+function loadLearned(): Learned[] {
+  try { return JSON.parse(localStorage.getItem(LEARN_KEY) || '[]'); } catch { return []; }
+}
+
+export function learnIntent(message: string, intent: NluIntent, ctx: NluContext) {
+  const tokens = keyTokens(normalize(message), ctx);
+  if (!tokens.length) return;
+  const list = loadLearned().filter((item) => item.tokens.join(' ') !== tokens.join(' '));
+  list.unshift({ tokens, intent });
+  try { localStorage.setItem(LEARN_KEY, JSON.stringify(list.slice(0, 200))); } catch { /* sem armazenamento */ }
+}
+
+// Memória compartilhada (vem do banco): frase -> intenção com votos de acerto/erro.
+export type SharedMemory = { tokens: string[]; intent: string; positive: number; negative: number };
+let shared: SharedMemory[] = [];
+let aliases: { kind: string; alias: string; value: string }[] = [];
+export function setSharedLearning(memory: SharedMemory[], aliasList: { kind: string; alias: string; value: string }[]) {
+  shared = memory || [];
+  aliases = aliasList || [];
+}
+export function phraseTokens(message: string, ctx: NluContext) {
+  return keyTokens(normalize(message), ctx);
+}
+
+// Troca apelidos aprendidos ("Cezinha" -> "Cezaro") antes de interpretar.
+export function applyAliases(raw: string) {
+  let out = raw;
+  for (const a of aliases) {
+    const re = new RegExp(`(^|[^\\wÀ-ú])(${a.alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})(?=$|[^\\wÀ-ú])`, 'gi');
+    out = out.replace(re, `$1${a.value}`);
+  }
+  return out;
+}
+
+// Ajuste de pontuação pelo que os usuários já ensinaram: acertos somam, erros subtraem.
+function memoryBoost(text: string, ctx: NluContext) {
+  const tokens = keyTokens(text, ctx);
+  const boost = new Map<string, number>();
+  if (!tokens.length) return boost;
+  const local = loadLearned().map((l) => ({ tokens: l.tokens, intent: l.intent as string, positive: 3, negative: 0 }));
+  for (const item of [...shared, ...local]) {
+    if (!item.tokens?.length) continue;
+    const inter = item.tokens.filter((t) => tokens.some((w) => wordLike(w, t))).length;
+    const sim = inter / Math.max(item.tokens.length, tokens.length);
+    if (sim < 0.6) continue;
+    const net = Math.max(-4, Math.min(5, (item.positive || 0) - (item.negative || 0) * 2));
+    boost.set(item.intent, (boost.get(item.intent) || 0) + net * 2 * sim);
+  }
+  return boost;
+}
+
+function learnedIntent(text: string, ctx: NluContext): NluIntent | null {
+  const tokens = keyTokens(text, ctx);
+  if (!tokens.length) return null;
+  let best: { intent: NluIntent; sim: number } | null = null;
+  for (const item of loadLearned()) {
+    const inter = item.tokens.filter((t) => tokens.some((w) => wordLike(w, t))).length;
+    const sim = inter / Math.max(item.tokens.length, tokens.length);
+    if (sim >= 0.6 && (!best || sim > best.sim)) best = { intent: item.intent, sim };
+  }
+  return best?.intent || null;
+}
+
+export function pastWords(text: string) {
+  return /pra tras|para tras|passad|d-1|d - 1|d1\b|anterior|ultimos dias|ultima semana|ontem|esteve|estava|tava\b|passou|atendeu|ja foi|foi atendid/.test(normalize(text));
+}
+
+// Intenções mais prováveis (para oferecer alternativas quando a ArIA errar).
+export function rankIntents(raw: string, ctx: NluContext, limit = 5): NluIntent[] {
+  const text = normalize(raw);
+  const slots: Slots = { tech: matchTechnician(text, ctx.technicians)?.name || '', branch: matchBranch(text, ctx.branches), dates: extractDates(raw), pin: extractPin(raw), city: '', screen: '' };
+  return RULES.map((rule) => {
+    const strong = hasStem(text, rule.strong);
+    const weak = !strong && rule.weak ? hasStem(text, rule.weak) : false;
+    const object = rule.objects ? hasStem(text, rule.objects, true) : false;
+    const score = (strong ? 5 : weak ? 2 : 0) + (object ? 2 : 0) + (strong || weak || object ? (rule.bonus ? rule.bonus(slots, text) : 0) : -99);
+    return { intent: rule.intent, score };
+  }).filter((r) => r.score > 0).sort((a, b) => b.score - a.score).slice(0, limit).map((r) => r.intent);
+}
+
+export function interpret(raw: string, ctx: NluContext, forced?: NluIntent, memory?: { tech?: string }): NluResult | null {
+  const text = normalize(raw);
+  let tech = matchTechnician(text, ctx.technicians);
+  if (!tech && memory?.tech && /\b(ele|ela|dele|dela|o mesmo|a mesma|esse tecnico|essa tecnica|mesmo tecnico|nele|nela)\b/.test(text)) {
+    const remembered = ctx.technicians.find((t) => t.name === memory.tech);
+    if (remembered) tech = { ...remembered, score: 3 };
+  }
+  const slots: Slots = {
+    tech: tech?.name || '',
+    branch: matchBranch(text, ctx.branches, tech?.branch),
+    dates: extractDates(raw),
+    pin: extractPin(raw),
+    city: tailAfter(raw, /(?:est[áa]|fica|localizad[ao]|trabalhando|rodando|operando)\s+em\s+([^,.;!?]+)/i),
+    screen: '',
+  };
+
+  let best: NluResult | null = null;
+  const scored: { intent: NluIntent; score: number }[] = [];
+  for (const rule of RULES) {
+    const strong = hasStem(text, rule.strong);
+    const weak = !strong && rule.weak ? hasStem(text, rule.weak) : false;
+    const object = rule.objects ? hasStem(text, rule.objects, true) : false;
+    if (!strong && !weak && !object) continue;
+    if (rule.intent === 'remarcar_atendimento' && !strong && !weak) continue;
+    if (rule.intent === 'pendencias_atrasadas' && !strong) continue;
+    let score = (strong ? 5 : weak ? 2 : 0) + (object ? 2 : 0) + (rule.bonus ? rule.bonus(slots, text) : 0);
+    if (rule.intent === 'agendar_atendimento' && /^ (agenda|preciso de|precisa de|quero) (uma|um|o|a|para|com|visita|atendimento)\b/.test(text)) score += 5;
+    if (rule.intent === 'agendar_atendimento' && /\bmarca(r)? como\b/.test(text)) score -= 6;
+    if (rule.intent === 'concluir_atendimento' && /\bmarca(r)? como\b/.test(text)) score += 2;
+    const newOne = /\b(uma|um|nova|novo) (visita|atendimento|revisao|campanha|150|garantia|diagnostico|entrega|os)\b/.test(text);
+    if (rule.intent === 'agendar_atendimento' && newOne) score += 4;
+    if (rule.intent === 'remarcar_atendimento' && newOne) score -= 4;
+    if (rule.intent === 'navegar' && !/\b(abr|ir para|vai para|mostr|acess|entra|leva)/.test(text)) score -= 3;
+    if (rule.intent === 'navegar' && slots.tech) score -= 5;
+    const aboutClients = /\bclientes?\b/.test(text) && !/\btecnic/.test(text) && !slots.tech;
+    if (aboutClients && ['desativar_tecnico', 'adicionar_tecnico', 'trocar_filial_tecnico', 'tecnicos_ociosos'].includes(rule.intent)) score -= 8;
+    scored.push({ intent: rule.intent, score });
+  }
+
+  // O que a equipe ensinou pesa na decisão (inclusive intenções sem palavra-chave).
+  const boost = memoryBoost(text, ctx);
+  for (const [intent, value] of boost) {
+    const hit = scored.find((x) => x.intent === intent);
+    if (hit) hit.score += value;
+    else if (RULES.some((r) => r.intent === intent) && value > 0) scored.push({ intent: intent as NluIntent, score: 2 + value });
+  }
+  for (const x of scored) if (x.score > (best?.score ?? 0)) best = { intent: x.intent, score: x.score, args: {} };
+
+  const learned = learnedIntent(text, ctx);
+  if (learned && (!best || best.score < 6) && (boost.get(learned) ?? 0) >= 0) best = { intent: learned, score: 6, args: {} };
+  if (forced) best = { intent: forced, score: 10, args: {} };
+  if (!best || best.score < 4) return null;
+
+  const [d1, d2] = slots.dates;
+  const clientTail = tailAfter(raw, /(?:cliente|empresa|da|do|para a|para o|pra|pro)\s+([A-ZÀ-Ú0-9][\wÀ-ú&.\- ]{2,60})/);
+  const tail = clientTail && !matchTechnician(normalize(clientTail), ctx.technicians) && !matchBranch(normalize(clientTail), ctx.branches) ? clientTail : '';
+  const nameAfterTech = tailAfter(raw, /(?:chamad[oa]|nome(?: d[eo])?|t[ée]cnic[oa](?: nov[oa])?)\s+(?!nov[oa]\b|chamad)([A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+)?)/);
+
+  switch (best.intent) {
+    case 'trocar_filial_tecnico': best.args = { tecnico: slots.tech, filial: slots.branch }; break;
+    case 'agendar_atendimento': {
+      const tipo = /\b150\b|150h|cento e cinquenta/.test(text) ? 'Visita 150h' : /campanha/.test(text) ? 'Campanha de campo'
+        : /garantia/.test(text) ? 'Garantia' : /\bpmp\b|preventiv/.test(text) ? 'Revisão PMP' : /diagnost/.test(text) ? 'Diagnóstico'
+          : /entrega tecnica|\bet\b/.test(text) ? 'Entrega Técnica' : /oficina/.test(text) ? 'Oficina' : '';
+      best.args = { tipo, pin: slots.pin, cliente: tail, tecnico: slots.tech, data: d1 || '' };
+      break;
+    }
+    case 'remarcar_atendimento': best.args = { tecnico: slots.tech, cliente_ou_pin: slots.pin || tail, data_atual: d2 ? d1 : '', nova_data: d2 || d1 || '' }; break;
+    case 'concluir_atendimento':
+    case 'excluir_atendimento': best.args = { tecnico: slots.tech, cliente_ou_pin: slots.pin || tail, data: d1 || '' }; break;
+    case 'adicionar_tecnico': best.args = { nome: slots.tech ? '' : nameAfterTech, filial: matchBranch(text, ctx.branches) }; break;
+    case 'desativar_tecnico': best.args = { tecnico: slots.tech }; break;
+    case 'criar_followup': best.args = { cliente: tail, data_retorno: d1 || '' }; break;
+    case 'informar_cidade_maquina': best.args = { pin: slots.pin, cidade: slots.city }; break;
+    case 'oportunidades_rota': best.args = { tecnico: slots.tech }; break;
+    case 'pendencias_filial': best.args = { filial: matchBranch(text, ctx.branches) }; break;
+    case 'navegar': best.args = { tela: text }; break;
+    case 'tecnicos_ociosos': best.args = { data: d1 || '', filial: matchBranch(text, ctx.branches) }; break;
+    case 'agenda_dia': best.args = { data: d1 || '', filial: matchBranch(text, ctx.branches), semana: /semana/.test(text) ? '1' : '' }; break;
+    case 'onde_tecnico': best.args = { tecnico: slots.tech, data: d1 || '' }; break;
+    case 'carga_semana':
+    case 'resumo_semana':
+    case 'atendimentos_incompletos':
+    case 'pendencias_atrasadas':
+    case 'pendentes_faturamento': best.args = { filial: matchBranch(text, ctx.branches), tecnico: slots.tech }; break;
+    case 'faturamento': best.args = { filial: matchBranch(text, ctx.branches), periodo: /\bmes\b/.test(text) ? 'mes' : /\bhoje\b/.test(text) ? 'hoje' : 'semana' }; break;
+    case 'faturar_atendimento': best.args = { tecnico: slots.tech, cliente_ou_pin: slots.pin || tail, data: d1 || '' }; break;
+    case 'historico_maquina': best.args = { pin: slots.pin }; break;
+    case 'registrar_horimetro': {
+      const cleaned = raw.replace(/\b(?=[A-Z0-9]*\d{4})[A-Z]{2,5}[A-Z0-9]{8,16}\b/gi, ' ');
+      const hours = (cleaned.match(/(\d{1,3}(?:[.\s]\d{3})+|\d{2,6})(?:[,.]\d)?\s*(?:h|hs|horas)?/i) || [])[1] || '';
+      best.args = { pin: slots.pin, horas: hours.replace(/[.\s]/g, '') };
+      break;
+    }
+    case 'contato_cliente': best.args = { cliente: tail || tailAfter(raw, /(?:telefone|contato|whatsapp|e-?mail|n[úu]mero)\s+(?:d[aoe]s?\s+)?(?:cliente\s+)?([^,.;!?]{3,60})/i) }; break;
+    case 'salvar_contato': {
+      const phone = (raw.match(/(\(?\d{2}\)?\s*9?\s*\d{4}[\s-]?\d{4})/) || [])[1] || '';
+      const who = tailAfter(raw, /(?:telefone|contato|whatsapp|celular|n[úu]mero)\s+(?:d[aoe]s?\s+)?(?:cliente\s+)?([A-Za-zÀ-ú][^0-9,.;!?]{2,60}?)\s+(?:[ée]|eh|=|:)/i) || tail;
+      best.args = { cliente: who.trim(), telefone: phone.trim() };
+      break;
+    }
+    case 'folga_ferias': best.args = { tecnico: slots.tech, tipo: /ferias/.test(text) ? 'Férias' : 'Folga', inicio: d1 || '', fim: d2 || '' }; break;
+    case 'realocar_dia': {
+      const both = ctx.technicians.map((t) => ({ t, at: text.indexOf(` ${normalize(t.name).trim().split(' ')[0]} `) })).filter((x) => x.at >= 0).sort((a, b) => a.at - b.at);
+      best.args = { tecnico: both[0]?.t.name || slots.tech, novo_tecnico: both[1]?.t.name || '', data: d1 || '' };
+      break;
+    }
+    case 'adicionar_observacao': best.args = { tecnico: slots.tech, cliente_ou_pin: slots.pin, data: d1 || '', texto: (raw.match(/[:\-–]\s*(.+)$/) || [])[1] || '' }; break;
+    case 'ajuda':
+    case 'aprendizado':
+    case 'sugestoes': best.args = {}; break;
+    case 'planejar_regiao': best.args = { tecnico: slots.tech, periodo: pastWords(text) ? 'passado' : /proxima semana|semana que vem|pra frente|proximos dias|vai atender/.test(text) ? 'futuro' : '', meses: (text.match(/\b(\d{1,2})\s*meses?\b/) || [])[1] || '', foco: /retenc|inativ|contato|prospec|parad/.test(text) ? 'retencao' : '', qtd: (text.match(/\b(\d{1,2})\s+(?:clientes?|sugestoes?|opcoes?)\b/) || [])[1] || '' }; break;
+  }
+  return best;
+}

@@ -1,0 +1,26 @@
+:root { --demo-h: 36px; }
+body { padding-top: var(--demo-h); }
+.demo-banner { position: fixed; top: 0; left: 0; right: 0; height: var(--demo-h); z-index: 20000; display: flex; align-items: center; gap: 10px; padding: 0 16px; background: repeating-linear-gradient(135deg, #fdba12 0 18px, #f5b000 18px 36px); color: #172033; font-size: 13px; box-shadow: 0 2px 10px rgba(15, 23, 42, .18); }
+.demo-banner strong { font-weight: 900; letter-spacing: .12em; background: #172033; color: #fdba12; padding: 3px 9px; border-radius: 6px; }
+.demo-banner-text { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.demo-banner button { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; border: 1px solid rgba(23, 32, 51, .35); background: rgba(255, 255, 255, .7); color: #172033; border-radius: 8px; padding: 5px 10px; font-size: 12px; font-weight: 700; }
+.demo-banner button:hover { background: #fff; }
+.sidebar { top: var(--demo-h) !important; }
+.topbar { top: var(--demo-h) !important; }
+.drawer-layer, .agenda-share-layer { top: var(--demo-h) !important; }
+.drawer-layer, .drawer-layer.drawer-layer-below-topbar { top: calc(var(--demo-h) + 82px) !important; }
+.drawer-layer .drawer { height: 100%; }
+@media (max-width: 640px) { .drawer-layer, .drawer-layer.drawer-layer-below-topbar { top: calc(var(--demo-h) + 70px) !important; } }
+.login-screen { min-height: calc(100vh - var(--demo-h)) !important; }
+.demo-confirm-layer { position: fixed; inset: 0; z-index: 20001; background: rgba(15, 23, 42, .45); display: grid; place-items: center; padding: 20px; }
+.demo-confirm { position: relative; width: min(460px, 100%); background: #fff; border-radius: 16px; padding: 24px; box-shadow: 0 24px 70px rgba(15, 23, 42, .25); display: grid; gap: 10px; color: #172033; }
+.demo-confirm strong { font-size: 18px; }
+.demo-confirm p { margin: 0; color: #5b6578; font-size: 13px; line-height: 1.55; }
+.demo-confirm > div { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.demo-confirm-close { position: absolute; right: 12px; top: 12px; border: 0; background: transparent; color: #687386; }
+.demo-login-hint { margin-top: 14px; border: 1px dashed #f5b000; background: #fff8e1; border-radius: 12px; padding: 12px 14px; display: grid; gap: 8px; }
+.demo-login-hint span { font-size: 12px; color: #6b5200; font-weight: 700; }
+.demo-login-hint div { display: flex; flex-wrap: wrap; gap: 6px; }
+.demo-login-hint button { border: 1px solid #e8c25a; background: #fff; border-radius: 999px; padding: 6px 12px; font-size: 12px; font-weight: 700; color: #172033; cursor: pointer; }
+.demo-login-hint button:hover { background: #fdba12; }
+@media (max-width: 760px) { .demo-banner-text { display: none; } }

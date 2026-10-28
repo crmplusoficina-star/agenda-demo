@@ -1,0 +1,276 @@
+import { useEffect, useState } from 'react';
+import { estimateRoute, type QuickRoute } from '../lib/quickRoute';
+import type { FormEvent } from 'react';
+import { Check, Loader2, MessageCircle, Route, Sparkles, Trash2 } from 'lucide-react';
+import { Drawer } from './Drawer';
+import { supabase } from '../lib/supabase';
+import type { AppointmentRouteMetric, MachineSummary, Technician } from '../types';
+import type { AppointmentDraft } from '../drafts';
+import '../features/service-programs.css';
+import { effectiveCity } from '../features/ServiceProgramsView';
+
+const reasons = [
+  'Garantia',
+  'Férias',
+  'Aplicação de peças',
+  'Medição material rodante',
+  'Oficina',
+  'Manutenção carro',
+  'Diagnóstico',
+  'Entrega Técnica',
+  'Revisão PMP',
+  'Revisão OS cliente',
+  'Equipamento parado',
+  'Deslocamento garantia',
+  'Deslocamento cliente',
+  'Deslocamento PMP',
+  'Retorno à filial',
+  'Folga',
+  'Sem agenda',
+  'Treinamento',
+  'Visita 150h',
+  'Campanha de campo',
+];
+
+function clientContactKey(branch: string, clientName: string) {
+  const cleanBranch = branch.trim().toUpperCase();
+  const cleanClient = clientName.trim().toUpperCase();
+  return cleanBranch && cleanClient ? `${cleanClient}|${cleanBranch}` : '';
+}
+
+const normText = (value?: string | null) => String(value || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim().toUpperCase();
+
+type Opportunity = { key: string; scope: 'maquina' | 'cidade'; text: string };
+
+function campaignMatches(equipment: string, pin: string | null, serial: string, model: string) {
+  const eq = equipment.trim().toUpperCase();
+  if (!eq) return false;
+  if (pin && eq === pin.trim().toUpperCase()) return true;
+  const sn = serial.trim().toUpperCase();
+  const md = (model.trim().toUpperCase().replace(/-/g, '').match(/^[A-Z]+[0-9]+/) || [''])[0];
+  return sn.length >= 4 && md.length >= 2 && eq.endsWith(sn) && eq.includes(md);
+}
+
+function whatsappNumber(value: string) {
+  let digits = value.replace(/\D/g, '');
+  if ((digits.length === 10 || digits.length === 11) && !digits.startsWith('55')) digits = `55${digits}`;
+  return digits;
+}
+
+export function AppointmentDrawer({ draft, setDraft, technicians, suggestions, machineContext, lastHourmeter, formError, saveBusy, onSubmit, onClose, onDelete, onSelectMachine, onSerialChange }: {
+  draft: AppointmentDraft | null;
+  setDraft: (draft: AppointmentDraft) => void;
+  technicians: Technician[];
+  suggestions: MachineSummary[];
+  machineContext: MachineSummary | null;
+  lastHourmeter: { hourmeter: number; reading_date: string } | null;
+  formError: string;
+  saveBusy: boolean;
+  onSubmit: (event: FormEvent) => void;
+  onClose: () => void;
+  onDelete: () => void;
+  onSelectMachine: (machine: MachineSummary) => void;
+  onSerialChange: (value: string) => void;
+}) {
+  const [clientContact, setClientContact] = useState('');
+  const [routePreview, setRoutePreview] = useState<AppointmentRouteMetric | null>(null);
+  const [routeBusy, setRouteBusy] = useState(false);
+  const [quick, setQuick] = useState<QuickRoute | null>(null);
+  const [quickBusy, setQuickBusy] = useState(false);
+  const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
+  const contactKey = draft ? clientContactKey(draft.branch, draft.client_name) : '';
+  const oppSerial = draft ? draft.equipment_serial.trim().toUpperCase() : '';
+  const oppCity = draft ? normText(draft.service_city) : '';
+  const oppReason = draft?.service_reason || '';
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!draft || (oppSerial.length < 5 && !oppCity)) {
+      setOpportunities([]);
+      return () => { cancelled = true; };
+    }
+    const timer = window.setTimeout(async () => {
+      const [{ data: inspections }, { data: campaigns }] = await Promise.all([
+        supabase.from('inspection_150h').select('pin,branch,client_name,city,service_city,delivery_date,programmed_date').is('executed_date', null).limit(2000),
+        supabase.from('campaign_machines').select('id,campaign_code,branch,model,serial_number,pin,client_name,city,service_city,programmed_date').is('executed_date', null).limit(2000),
+      ]);
+      if (cancelled) return;
+      const found: Opportunity[] = [];
+      for (const row of inspections || []) {
+        const pending = row.programmed_date ? 'pendente de execução' : 'pendente de programação';
+        if (oppSerial && row.pin === oppSerial) {
+          if (oppReason !== 'Visita 150h') found.push({ key: `i-${row.pin}`, scope: 'maquina', text: `Inspeção 150h ${pending} nesta máquina` });
+        } else if (oppCity && normText(effectiveCity(row)) === oppCity) {
+          found.push({ key: `i-${row.pin}`, scope: 'cidade', text: `Inspeção 150h ${pending}: ${row.client_name || row.pin} (${row.pin})` });
+        }
+      }
+      for (const row of campaigns || []) {
+        const pending = row.programmed_date ? 'pendente de execução' : 'pendente';
+        if (oppSerial && campaignMatches(oppSerial, row.pin, row.serial_number, row.model)) {
+          if (oppReason !== 'Campanha de campo') found.push({ key: `c-${row.id}`, scope: 'maquina', text: `Campanha ${row.campaign_code} ${pending} nesta máquina` });
+        } else if (oppCity && normText(effectiveCity(row)) === oppCity) {
+          found.push({ key: `c-${row.id}`, scope: 'cidade', text: `Campanha ${row.campaign_code} ${pending}: ${row.client_name || `${row.model}-${row.serial_number}`}` });
+        }
+      }
+      found.sort((a, b) => (a.scope === b.scope ? 0 : a.scope === 'maquina' ? -1 : 1));
+      setOpportunities(found);
+    }, 400);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [Boolean(draft), oppSerial, oppCity, oppReason]); // eslint-disable-line react-hooks/exhaustive-deps
+  const waNumber = whatsappNumber(clientContact);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!contactKey) {
+      setClientContact('');
+      return () => { cancelled = true; };
+    }
+
+    async function loadClientContact() {
+      const { data } = await supabase.from('client_contacts').select('phone').eq('client_key', contactKey).limit(1);
+      if (!cancelled) setClientContact(String((data || [])[0]?.phone || ''));
+    }
+
+    void loadClientContact();
+    return () => { cancelled = true; };
+  }, [contactKey]);
+
+  async function saveClientContact() {
+    if (!draft || !contactKey || !clientContact.trim()) return;
+    await supabase.from('client_contacts').upsert({
+      client_key: contactKey,
+      branch: draft.branch.trim().toUpperCase(),
+      client_name: draft.client_name.trim(),
+      phone: clientContact.trim(),
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'client_key' });
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!draft?.id) {
+      setRoutePreview(null);
+      setRouteBusy(false);
+      return () => { cancelled = true; };
+    }
+
+    setRouteBusy(true);
+    async function loadStoredRouteMetric() {
+      const { data, error } = await supabase
+        .from('agenda_route_metrics')
+        .select('appointment_id,technician_id,appointment_date,week_start,origin_kind,origin_appointment_id,origin_label,destination_label,destination_city,destination_state,distance_km,duration_min,status,provider,segment_key,calculated_at')
+        .eq('appointment_id', draft!.id)
+        .maybeSingle();
+
+      if (cancelled) return;
+      if (error) console.error('appointment_route_metric_load_failed', error);
+      setRoutePreview((data || null) as AppointmentRouteMetric | null);
+      setRouteBusy(false);
+    }
+
+    void loadStoredRouteMetric();
+    return () => { cancelled = true; };
+  }, [draft?.id]);
+
+  // Estimativa imediata enquanto o usuário preenche (não espera o worker da nuvem).
+  useEffect(() => {
+    if (!draft) { setQuick(null); return; }
+    let cancelled = false;
+    setQuick(null);
+    setQuickBusy(true);
+    const timer = window.setTimeout(async () => {
+      try {
+        const result = await estimateRoute({
+          id: draft.id, technician_id: draft.technician_id, appointment_date: draft.appointment_date, branch: draft.branch,
+          service_city: draft.service_city || '', client_name: draft.client_name || '', service_reason: draft.service_reason, description: draft.description, created_at: (draft as any).created_at,
+        });
+        if (!cancelled) setQuick(result);
+      } catch {
+        if (!cancelled) setQuick(null);
+      } finally {
+        if (!cancelled) setQuickBusy(false);
+      }
+    }, 500);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [draft?.id, draft?.technician_id, draft?.appointment_date, draft?.service_city, draft?.service_reason, draft?.branch, draft?.client_name]);
+
+  const cloudReady = Boolean(draft && routePreview?.status === 'ready' && routePreview.distance_km != null
+    && routePreview.appointment_date === draft.appointment_date && routePreview.technician_id === draft.technician_id
+    && normText(routePreview.destination_city) === normText(draft.service_city));
+
+  return <Drawer open={Boolean(draft)} title={draft?.id ? 'Editar atendimento' : 'Novo atendimento'} subtitle="Somente o necessário para organizar bem a visita." onClose={onClose} wide>
+    {draft && <form className="form-stack" onSubmit={onSubmit}>
+      <div className="form-grid two"><label>Data<input type="date" value={draft.appointment_date} onChange={(e) => setDraft({ ...draft, appointment_date: e.target.value })} /></label><label>Técnico<select value={draft.technician_id} onChange={(e) => { const t = technicians.find((x) => x.id === e.target.value); const nextBranch = t?.branch || draft.branch; setDraft({ ...draft, technician_id: e.target.value, branch: nextBranch, service_city: draft.service_reason === 'Retorno à filial' ? nextBranch : draft.service_city }); }}><option value="">Selecione o técnico</option>{technicians.map((t) => <option key={t.id} value={t.id}>{t.name} · {t.branch}</option>)}</select></label></div>
+      <label className="serial-field">Série da máquina<input value={draft.equipment_serial} onChange={(e) => onSerialChange(e.target.value.toUpperCase())} placeholder="Digite parte da série" autoComplete="off" />{suggestions.length > 0 && <div className="suggestions">{suggestions.map((m) => <button type="button" key={m.serial} onClick={() => onSelectMachine(m)}><strong>{m.serial}</strong><span>{m.client_name || 'Cliente não informado'} · {m.city || 'Cidade não informada'}</span></button>)}</div>}</label>
+      {machineContext && <div className="context-strip"><div><span>Último atendimento G4</span><strong>{machineContext.last_service_at ? new Intl.DateTimeFormat('pt-BR').format(new Date(machineContext.last_service_at)) : '—'}</strong></div><div><span>Histórico</span><strong>{machineContext.service_count} OS</strong></div><div><span>Última operação</span><strong>{machineContext.last_operation_type || '—'}</strong></div></div>}
+      {opportunities.length > 0 && <div className="opportunity-box">
+        <img className="opportunity-avatar" src="/aria/aria-insight.webp" alt="ArIA" />
+        <div className="opportunity-content">
+          <div className="opportunity-head"><Sparkles size={15}/><strong>ArIA: oportunidades para esta visita</strong></div>
+          <ul>{opportunities.slice(0, 8).map((item) => <li key={item.key} className={item.scope === 'maquina' ? 'is-machine' : ''}>{item.scope === 'cidade' ? 'Mesma cidade · ' : ''}{item.text}</li>)}</ul>
+          {opportunities.length > 8 && <small>+{opportunities.length - 8} pendências na cidade. Veja em Visita 150h e Campanhas.</small>}
+        </div>
+      </div>}
+      <div className="form-grid two"><label>Cliente<input value={draft.client_name} onChange={(e) => setDraft({ ...draft, client_name: e.target.value })} /></label><label>Cidade<input value={draft.service_city} onChange={(e) => setDraft({ ...draft, service_city: e.target.value })} /></label></div>
+      <label>Distância do último atendimento <span style={{ color: '#94a3b8', fontWeight: 500 }}>(automático)</span>
+        <div style={{ display: 'grid', gridTemplateColumns: '34px 1fr', gap: 8, alignItems: 'center' }}>
+          <span style={{ width: 34, height: 34, borderRadius: 8, background: '#f1f5f9', color: '#475569', display: 'grid', placeItems: 'center' }}>{(routeBusy || quickBusy) && !cloudReady && !quick ? <Loader2 className="spin" size={16}/> : <Route size={16}/>}</span>
+          <input
+            readOnly
+            value={cloudReady
+              ? `${routePreview!.distance_km!.toLocaleString('pt-BR')} km`
+              : quick
+                ? `${quick.km.toLocaleString('pt-BR')} km${quick.approx ? ' (aproximado)' : ''}`
+                : quickBusy || routeBusy
+                  ? 'Calculando...'
+                  : !draft.service_city.trim()
+                    ? 'Informe a cidade'
+              : routePreview?.status === 'ready' && routePreview.distance_km != null
+                ? `${routePreview.distance_km.toLocaleString('pt-BR')} km`
+                : routePreview?.status === 'location_missing'
+                  ? 'Localização pendente'
+                  : routePreview?.status === 'route_unavailable'
+                    ? 'Rota pendente'
+                    : draft.id
+                      ? 'Em processamento na nuvem'
+                      : 'Calculado na nuvem após salvar'}
+            style={{ background: '#f8fafc', color: '#475569', cursor: 'default' }}
+          />
+        </div>
+        <small style={{ marginTop: 5, color: '#94a3b8', fontWeight: 500 }}>
+          {cloudReady
+            ? `${routePreview!.origin_label || 'Origem'} → ${routePreview!.destination_label || draft.service_city || 'Destino'}${routePreview!.duration_min != null ? ` · ~${routePreview!.duration_min} min` : ''}`
+            : quick
+              ? `${quick.from} → ${quick.to} · ~${quick.min} min${quick.approx ? ' · linha reta x1,3 (roteador indisponível)' : ''}`
+            : routePreview?.status === 'ready'
+            ? `${routePreview.origin_label || 'Origem'} → ${routePreview.destination_label || draft.service_city || 'Destino'}${routePreview.duration_min != null ? ` · ~${routePreview.duration_min} min` : ''}`
+            : routePreview?.status === 'location_missing'
+              ? 'A nuvem ainda está resolvendo a cidade/UF deste atendimento.'
+              : routePreview?.status === 'route_unavailable'
+                ? 'O worker cloud tentará novamente automaticamente.'
+                : draft.id
+                  ? 'Aguardando processamento do worker cloud.'
+                  : 'Após salvar, a rota entra na fila SQL e é calculada na nuvem.'}
+        </small>
+      </label>
+      <label>Contato do cliente <span style={{ color: '#94a3b8', fontWeight: 500 }}>(opcional)</span>
+        <div style={{ display: 'grid', gridTemplateColumns: waNumber ? '1fr auto' : '1fr', gap: 8, alignItems: 'center' }}>
+          <input inputMode="tel" value={clientContact} onChange={(e) => setClientContact(e.target.value)} onBlur={() => { void saveClientContact(); }} placeholder="Ex.: (91) 99999-9999" />
+          {waNumber && <a href={`https://wa.me/${waNumber}`} target="_blank" rel="noreferrer" onClick={() => { void saveClientContact(); }} style={{ minHeight: 42, padding: '0 13px', borderRadius: 9, border: '1px solid #bbf7d0', background: '#f0fdf4', color: '#15803d', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 7, textDecoration: 'none', fontSize: 12, fontWeight: 750, whiteSpace: 'nowrap' }}><MessageCircle size={16}/> WhatsApp</a>}
+        </div>
+        <small style={{ marginTop: 5, color: '#94a3b8', fontWeight: 500 }}>Preencha uma vez. Nos próximos atendimentos do mesmo cliente, o número será carregado automaticamente.</small>
+      </label>
+      <label>Motivo do atendimento<select value={draft.service_reason} onChange={(e) => { const nextReason = e.target.value; setDraft({ ...draft, service_reason: nextReason, service_city: nextReason === 'Retorno à filial' ? draft.branch : draft.service_city }); }}><option value="">Selecione</option>{reasons.map((r) => <option key={r}>{r}</option>)}</select></label>
+      <label>Descrição<textarea rows={3} value={draft.description} onChange={(e) => setDraft({ ...draft, description: e.target.value })} placeholder="Ex.: ar-condicionado com baixo rendimento" /></label>
+
+      <div className="hourmeter-block"><div><span>Último horímetro conhecido</span><strong>{lastHourmeter ? `${lastHourmeter.hourmeter.toLocaleString('pt-BR')} h` : 'Sem leitura anterior'}</strong>{lastHourmeter && <small>{new Intl.DateTimeFormat('pt-BR').format(new Date(`${lastHourmeter.reading_date}T12:00:00`))}</small>}</div><label>Horímetro atual da máquina<input inputMode="decimal" value={draft.reported_hourmeter} onChange={(e) => setDraft({ ...draft, reported_hourmeter: e.target.value })} placeholder="Opcional" /></label>{lastHourmeter && draft.reported_hourmeter !== '' && Number(draft.reported_hourmeter) >= lastHourmeter.hourmeter && <div className="hourmeter-delta">+{(Number(draft.reported_hourmeter) - lastHourmeter.hourmeter).toLocaleString('pt-BR')} h</div>}</div>
+      <div className="form-grid two">
+        <label>Previsão de faturamento<input inputMode="decimal" value={draft.forecast_amount} onChange={(e) => setDraft({ ...draft, forecast_amount: e.target.value })} placeholder="0,00" /></label>
+        <label>Status do faturamento<select value={draft.billing_status === 'faturado' ? 'faturado' : draft.billing_status === 'aguardando_faturamento' ? 'aguardando_faturamento' : 'nao_precificado'} onChange={(e) => setDraft({ ...draft, billing_status: e.target.value })}><option value="nao_precificado">-</option><option value="aguardando_faturamento">Pendente</option><option value="faturado">Faturado</option></select></label>
+      </div>
+      {formError && <div className="form-error">{formError}</div>}
+      <div className="drawer-actions">{draft.id ? <button type="button" className="danger-button" onClick={onDelete}><Trash2 size={16}/> Excluir</button> : <span/>}<button type="button" className="subtle-button" onClick={onClose}>Cancelar</button><button className="primary-button" disabled={saveBusy}>{saveBusy ? <Loader2 className="spin" size={17}/> : <Check size={17}/>} Salvar</button></div>
+    </form>}
+  </Drawer>;
+}
